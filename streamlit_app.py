@@ -1,6 +1,6 @@
 """
 스마트공장 공급기업 수집기 — SmartFind v2
-체크박스 필터 → 수집 → 엑셀 다운로드
+체크박스 필터 → 수집 → 엑셀 다운로드 → 드래그앤드롭 업데이트
 """
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from pathlib import Path
 import streamlit as st
 import pandas as pd
 import requests
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
 
@@ -322,6 +322,100 @@ def _build_excel(items: list[dict], filter_desc: str = "") -> bytes:
     return buf.getvalue()
 
 
+EXCEL_HEADERS = [c[1] for c in [
+    ("instNm", "업체명", 24), ("splyInstSe", "공급기업 구분", 22),
+    ("splyCnstcNocs", "구축건수", 10), ("splyLctnCdNm", "지역", 8),
+    ("splyWholEmpCnt", "종사자규모", 12), ("splySlsAmt", "매출규모(억)", 14),
+    ("slsYr", "매출연도", 10), ("splyDgstfnScr", "만족도(5점)", 12),
+    ("splyMfrcSpcltyFldNm", "주력분야", 30), ("splySpcltyFldNm", "전문분야", 42),
+    ("splyTpbizNm", "특화업종", 48), ("rprsvNm", "대표자", 10),
+    ("fndnYmd", "설립일", 12), ("instAddr", "주소", 38),
+    ("rprsTelno", "대표전화", 16), ("rprsFxno", "팩스", 16),
+    ("hmpgAddr", "홈페이지", 26), ("brno", "사업자번호", 14),
+]]
+
+EXCEL_KEYS = [
+    "instNm", "splyInstSe", "splyCnstcNocs", "splyLctnCdNm",
+    "splyWholEmpCnt", "splySlsAmt", "slsYr", "splyDgstfnScr",
+    "splyMfrcSpcltyFldNm", "splySpcltyFldNm", "splyTpbizNm",
+    "rprsvNm", "fndnYmd", "instAddr", "rprsTelno", "rprsFxno",
+    "hmpgAddr", "brno",
+]
+
+
+def _parse_uploaded_excel(uploaded_file) -> list[dict]:
+    """업로드된 엑셀에서 기존 데이터를 dict 리스트로 변환."""
+    import re
+    df = pd.read_excel(uploaded_file, sheet_name=0)
+    header_to_key = dict(zip(EXCEL_HEADERS, EXCEL_KEYS))
+    df = df.rename(columns={h: header_to_key.get(h, h) for h in df.columns})
+    records = []
+    for _, row in df.iterrows():
+        rec = {}
+        for key in EXCEL_KEYS:
+            val = row.get(key, "")
+            if pd.isna(val):
+                val = ""
+            val = str(val).strip()
+            # 만족도 "★★★ (3.5)" → 3.5
+            if key == "splyDgstfnScr" and "★" in val:
+                m = re.search(r"\(([\d.]+)\)", val)
+                val = m.group(1) if m else "0"
+            # 매출 "32억" → 32
+            if key == "splySlsAmt" and "억" in val:
+                val = val.replace("억", "").strip()
+            rec[key] = val
+        records.append(rec)
+    return records
+
+
+def _merge_data(old_items: list[dict], new_items: list[dict]) -> tuple[list[dict], int, int]:
+    """기존 + 신규 병합. instCd(기관코드) 또는 업체명+사업자번호로 중복 판별.
+    Returns: (merged, new_count, updated_count)
+    """
+    def _item_key(item):
+        code = str(item.get("instCd", "") or item.get("기관코드", "")).strip()
+        if code:
+            return code
+        name = str(item.get("instNm", "") or item.get("업체명", "")).strip()
+        brno = str(item.get("brno", "") or item.get("사업자번호", "")).strip()
+        return f"{name}|{brno}"
+
+    old_map = {}
+    for item in old_items:
+        k = _item_key(item)
+        if k:
+            old_map[k] = item
+
+    merged = list(old_items)
+    new_count = 0
+    updated_count = 0
+
+    for item in new_items:
+        k = _item_key(item)
+        if not k:
+            continue
+
+        if k in old_map:
+            old = old_map[k]
+            changed = False
+            for field in EXCEL_KEYS:
+                new_val = str(item.get(field, "") or "").strip()
+                old_val = str(old.get(field, "") or "").strip()
+                # 만족도/매출 등 숫자 비교 정규화
+                if new_val and new_val not in ("-", "0", "") and new_val != old_val:
+                    old[field] = item[field]
+                    changed = True
+            if changed:
+                updated_count += 1
+        else:
+            merged.append(item)
+            old_map[k] = item
+            new_count += 1
+
+    return merged, new_count, updated_count
+
+
 # =============================================================================
 #  UI
 # =============================================================================
@@ -482,3 +576,54 @@ if filtered:
         st.dataframe(df, use_container_width=True, hide_index=True)
 else:
     st.warning("선택한 조건에 해당하는 기업이 없습니다.")
+
+# =============================================================================
+#  드래그앤드롭 업데이트
+# =============================================================================
+st.markdown("---")
+st.markdown("### 📂 기존 엑셀 업데이트")
+st.caption("이전에 다운받은 엑셀을 올리면, 신규/변경된 기업만 추가해서 다시 다운로드합니다.")
+
+uploaded = st.file_uploader(
+    "이전 엑셀 파일을 드래그앤드롭 하세요",
+    type=["xlsx"],
+    key="excel_upload",
+    help="이전에 다운받은 스마트공장 공급기업 엑셀 파일",
+)
+
+if uploaded and all_data:
+    try:
+        old_items = _parse_uploaded_excel(uploaded)
+        merged, new_cnt, upd_cnt = _merge_data(old_items, filtered)
+
+        # 결과 표시
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("기존 데이터", f"{len(old_items):,}건")
+        c2.metric("현재 수집", f"{len(filtered):,}건")
+        c3.metric("신규 추가", f"+{new_cnt}건", delta=f"+{new_cnt}" if new_cnt else None)
+        c4.metric("정보 갱신", f"{upd_cnt}건", delta=f"↑{upd_cnt}" if upd_cnt else None)
+
+        if new_cnt > 0 or upd_cnt > 0:
+            st.markdown(f"""<div class="done-box">
+            <div class="icon">🔄</div>
+            <div class="msg">병합 완료! 총 {len(merged):,}건</div>
+            <div class="detail">신규 +{new_cnt}건 · 갱신 {upd_cnt}건</div>
+            </div>""", unsafe_allow_html=True)
+
+            merge_desc = f"병합 (기존 {len(old_items):,} + 신규 {new_cnt} + 갱신 {upd_cnt})"
+            merged_excel = _build_excel(merged, merge_desc)
+            ts = datetime.now().strftime("%Y%m%d_%H%M")
+
+            st.download_button(
+                f"📥 병합 엑셀 다운로드 ({len(merged):,}건)",
+                merged_excel,
+                f"스마트공장_공급기업_병합_{ts}.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                type="primary",
+            )
+        else:
+            st.success("✅ 변경 사항 없음 — 기존 엑셀이 최신 상태입니다.")
+
+    except Exception as e:
+        st.error(f"엑셀 파일 처리 오류: {e}")
